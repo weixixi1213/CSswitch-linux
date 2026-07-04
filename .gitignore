@@ -1,5 +1,6 @@
 # Runtime state
 .csswitch-linux/
+dist/
 run/
 logs/
 home/
