@@ -1,14 +1,28 @@
-*.tar
-*.tar.*
-*.jar
-*.exe
-*.msi
-*.deb
-*.zip
-*.tgz
-*.log
-*.log.*
-*.sig
+# Runtime state
+.csswitch-linux/
+run/
+logs/
+home/
+*.pid
+*.secret
 
-pkg/
-src/
+# Local credentials and environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.enc
+*.token
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
