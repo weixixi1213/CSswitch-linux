@@ -254,8 +254,9 @@ if not data.get("authenticated"):
 PY
   rm -f "$cookie"
   trap - RETURN
-  SCIENCE_URL="$url"
   AUTH_STATUS_JSON="$auth_json"
+  # The nonce used for verification is single-use. Print a fresh browser URL.
+  SCIENCE_URL="$(HOME="$SANDBOX_HOME" "$SCIENCE_BIN" url --data-dir "$DATA_DIR" 2>/dev/null | head -n 1)"
 }
 
 echo "== ensure virtual login =="
