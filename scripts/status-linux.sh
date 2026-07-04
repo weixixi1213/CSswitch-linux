@@ -58,3 +58,6 @@ PY
     fi
   fi
 fi
+
+echo "== access url =="
+HOME="$SANDBOX_HOME" "$SCIENCE_BIN" url --data-dir "$DATA_DIR" 2>/dev/null | tail -n 1 || true
