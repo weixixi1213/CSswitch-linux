@@ -175,15 +175,6 @@ PYTHON_BIN=/path/to/python3 csswitch-linux-start --provider qwen --api-key "$DAS
 
 ## 开源说明
 
-本仓库是从服务器上的 `csswitch-linux` 运行方案整理出的独立开源版本。实际运行产生的状态目录、日志、密钥文件和第三方依赖缓存均已排除。
-
-发布前建议再次检查：
-
-```bash
-git status --short
-python3 -m py_compile proxy/csswitch_proxy.py proxy/dsml_shim.py proxy/qwen_proxy.py scripts/make-virtual-oauth.py
-bash -n scripts/*.sh
-```
 
 ## 许可证
 
