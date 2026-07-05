@@ -54,6 +54,7 @@ sudo scripts/install-linux.sh
 
 ```bash
 csswitch-linux-start
+csswitch-linux-fetch-models
 csswitch-linux-stop
 csswitch-linux-status
 csswitch-linux-verify-proxy
@@ -76,11 +77,21 @@ csswitch-linux-start --provider qwen --api-key "$DASHSCOPE_API_KEY"
 Anthropic 兼容中转站：
 
 ```bash
-csswitch-linux-start \
+csswitch-linux-fetch-models \
   --provider relay \
   --api-key "$CSSWITCH_RELAY_KEY" \
   --relay-base "$CSSWITCH_RELAY_BASE_URL"
 ```
+
+```bash
+csswitch-linux-start \
+  --provider relay \
+  --api-key "$CSSWITCH_RELAY_KEY" \
+  --relay-base "$CSSWITCH_RELAY_BASE_URL" \
+  --relay-model "claude-sonnet-5"
+```
+
+涓嶄紶 `--relay-model` 鏃讹紝鍚姩鑴氭湰浼氬厛鑷姩鎷?relay 鐨?`/v1/models`锛岄粯璁ら€夌涓€涓繑鍥炴ā鍨嬩綔涓哄浐瀹氭ā鍨嬨€?
 
 查看状态：
 

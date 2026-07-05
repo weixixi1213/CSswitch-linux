@@ -20,6 +20,7 @@ STATE_ROOT="${STATE_ROOT:-${HOME:-/root}/.csswitch-linux}"
 EMAIL="${EMAIL:-virtual@localhost.invalid}"
 UNSAFE_FULL_ACCESS=0
 SKIP_ONBOARDING=1
+AUTO_SELECTED_RELAY_MODEL=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -149,6 +150,37 @@ finally:
 PY
 }
 
+discover_relay_model() {
+  local tmp_json
+  tmp_json="$(mktemp)"
+  trap 'rm -f "$tmp_json"' RETURN
+  "$SCRIPT_DIR/fetch-models-linux.sh" \
+    --provider relay \
+    --api-key "$API_KEY" \
+    --relay-base "$RELAY_BASE" \
+    --json \
+    >"$tmp_json"
+  RELAY_MODEL="$("$PYTHON_BIN" - "$tmp_json" <<'PY'
+import json
+import sys
+
+data = json.loads(open(sys.argv[1], encoding="utf-8").read()).get("data") or []
+print((data[0] or {}).get("id", "") if data else "")
+PY
+)"
+  if [[ -z "$RELAY_MODEL" ]]; then
+    echo "relay fetch-models returned no models" >&2
+    exit 1
+  fi
+  AUTO_SELECTED_RELAY_MODEL=1
+  rm -f "$tmp_json"
+  trap - RETURN
+}
+
+if [[ "$PROVIDER" == "relay" && -z "$RELAY_MODEL" ]]; then
+  discover_relay_model
+fi
+
 stop_proxy_if_running() {
   if [[ -f "$PROXY_PID_FILE" ]]; then
     local pid
@@ -266,6 +298,13 @@ patch_preferences
 echo "== start proxy =="
 start_proxy
 echo "proxy: ${MASKED_PROXY_URL}"
+if [[ "$PROVIDER" == "relay" ]]; then
+  if [[ "$AUTO_SELECTED_RELAY_MODEL" == "1" ]]; then
+    echo "relay model: $RELAY_MODEL (auto-selected)"
+  else
+    echo "relay model: $RELAY_MODEL"
+  fi
+fi
 
 echo "== start claude-science =="
 start_science

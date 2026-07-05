@@ -331,6 +331,13 @@ def build_models_response():
       - relay 网络异常 → (502, {error_kind:"network", upstream_status:None, message})。
       - 非 relay（无 models_url，deepseek/qwen）→ (200, {静态选择器列表})，行为不变。"""
     if PROV.get("models_url"):
+        if RELAY_FORCE_MODEL:
+            shell = [{"type": "model", "id": "claude-opus-4-8",
+                      "display_name": RELAY_FORCE_MODEL, "supports_tools": None,
+                      "created_at": "2026-01-01T00:00:00Z"}]
+            log(f"GET /v1/models -> {PROV_NAME}(force shell): {RELAY_FORCE_MODEL}")
+            return 200, {"data": shell, "has_more": False,
+                         "first_id": "claude-opus-4-8", "last_id": "claude-opus-4-8"}
         try:
             data = fetch_relay_models()
             log(f"GET /v1/models -> {PROV_NAME}(回源): {len(data)} 个模型")
