@@ -20,12 +20,14 @@ Providers:
   DASHSCOPE_API_KEY=... python3 csswitch_proxy.py --provider qwen --port 18991
 """
 import argparse
+import http.client
 import json
 import os
 import re
 import select
 import socket
 import sys
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -121,6 +123,7 @@ LOG = None
 PROV_NAME = None  # 运行时设定；模块被 import 做测试时也要有定义，避免 handler NameError
 AUTH_SECRET = None  # 未设则不启用鉴权（保持旧行为）
 _DATE_SUFFIX = re.compile(r"-\d{8}$")
+_SCIENCE_MODEL_ID = re.compile(r"^claude-(opus|sonnet|haiku)-(\d+)(?:-(\d+))?(?:-\d{8})?$")
 # relay 模式：最近一次 /v1/models 回源拉到的上游模型 id 列表。resolve_model 用它把
 # Science 发来的裸 id（如标题 agent 的 claude-haiku-4-5）贴合到中转站真实 id
 # （如 claude-haiku-4-5-20251001）。首拉前为空 → 纯透传。
@@ -131,6 +134,15 @@ RELAY_FORCE_MODEL = None
 # 出站 User-Agent：部分中转站的 WAF 把默认的 "Python-urllib/x.y" 判为 bot 直接 403
 # （byteswarm 实测），故所有上游请求统一带一个非 bot 的 UA。
 UPSTREAM_UA = "CSSwitch/0.2 (+https://github.com/SuperJJ007/CSSwitch)"
+SCIENCE_SHIM_HOST = None
+SCIENCE_SHIM_PORT = None
+SCIENCE_UPSTREAM_HOST = "127.0.0.1"
+SCIENCE_UPSTREAM_PORT = None
+SCIENCE_DEFAULT_MODEL = None
+HOP_BY_HOP_HEADERS = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade",
+}
 
 # ---------- #3: targeted fast-fail（沙箱「Switching organization」卡死修复） ----------
 # 沙箱 Science 启动时会对 claude.ai/api/oauth/profile 发【阻塞式】请求解析组织；
@@ -331,13 +343,6 @@ def build_models_response():
       - relay 网络异常 → (502, {error_kind:"network", upstream_status:None, message})。
       - 非 relay（无 models_url，deepseek/qwen）→ (200, {静态选择器列表})，行为不变。"""
     if PROV.get("models_url"):
-        if RELAY_FORCE_MODEL:
-            shell = [{"type": "model", "id": "claude-opus-4-8",
-                      "display_name": RELAY_FORCE_MODEL, "supports_tools": None,
-                      "created_at": "2026-01-01T00:00:00Z"}]
-            log(f"GET /v1/models -> {PROV_NAME}(force shell): {RELAY_FORCE_MODEL}")
-            return 200, {"data": shell, "has_more": False,
-                         "first_id": "claude-opus-4-8", "last_id": "claude-opus-4-8"}
         try:
             data = fetch_relay_models()
             log(f"GET /v1/models -> {PROV_NAME}(回源): {len(data)} 个模型")
@@ -362,6 +367,68 @@ def build_models_response():
     return 200, {"data": data, "has_more": False,
                  "first_id": data[0]["id"] if data else None,
                  "last_id": data[-1]["id"] if data else None}
+
+
+def selector_models():
+    """返回当前 provider 可供 UI 展示的模型列表。relay 回源，其余 provider 用静态表。"""
+    if PROV.get("models_url"):
+        return fetch_relay_models()
+    return [{"type": "model", "id": mid, "display_name": disp, "supports_tools": None,
+             "created_at": "2026-01-01T00:00:00Z"} for mid, disp in PROV["models"]]
+
+
+def _science_model_name(model_id, display_name=None):
+    match = _SCIENCE_MODEL_ID.match(model_id or "")
+    if match:
+        family, major, minor = match.groups()
+        version = major if minor is None else f"{major}.{minor}"
+        return f"Claude {family.title()} {version}"
+    return display_name or model_id
+
+
+def build_science_models_response():
+    """装配 Claude Science Web UI 读取的 /api/models 响应。"""
+    default_model = SCIENCE_DEFAULT_MODEL or RELAY_FORCE_MODEL or PROV.get("default_model") or "claude-opus-4-8"
+    try:
+        raw_models = selector_models()
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            pass
+        log(f"GET /api/models -> {PROV_NAME} 回源 HTTP {e.code}，降级为默认模型: {detail}")
+        raw_models = []
+    except Exception as e:
+        log(f"GET /api/models -> {PROV_NAME} 回源异常，降级为默认模型: {e}")
+        raw_models = []
+
+    models = []
+    seen_families = set()
+    for item in raw_models:
+        model_id = item.get("id")
+        if not model_id:
+            continue
+        model = {
+            "id": model_id,
+            "name": _science_model_name(model_id, item.get("display_name")),
+        }
+        match = _SCIENCE_MODEL_ID.match(model_id)
+        if match:
+            family = match.group(1)
+            if family in seen_families:
+                model["overflow"] = True
+            else:
+                seen_families.add(family)
+        models.append(model)
+
+    if not models:
+        models = [{"id": default_model, "name": _science_model_name(default_model)}]
+    elif not any(item.get("id") == default_model for item in models):
+        default_model = models[0]["id"]
+
+    log(f"GET /api/models -> {len(models)} 个模型(default={default_model})")
+    return 200, {"models": {"anthropic": models}, "default_model_id": default_model}
 
 
 # ---------- Anthropic -> OpenAI 翻译（qwen 路径） ----------
@@ -835,6 +902,186 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(b"0\r\n\r\n")
 
 
+class ScienceShimH(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "csswitch-science-shim"
+
+    def log_message(self, *a):
+        pass
+
+    def _send_json(self, code, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        if self.close_connection:
+            self.send_header("Connection", "close")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _path_only(self):
+        return self.path.split("?", 1)[0]
+
+    def _is_websocket_upgrade(self):
+        connection = self.headers.get("Connection", "")
+        upgrade = self.headers.get("Upgrade", "")
+        return "upgrade" in connection.lower() and bool(upgrade)
+
+    def _forward_headers(self, *, keep_upgrade=False):
+        out = {}
+        for key, value in self.headers.items():
+            lower = key.lower()
+            if lower == "host":
+                continue
+            if lower in HOP_BY_HOP_HEADERS and not (keep_upgrade and lower in ("connection", "upgrade")):
+                continue
+            out[key] = value
+        host = SCIENCE_UPSTREAM_HOST or "127.0.0.1"
+        port = SCIENCE_UPSTREAM_PORT
+        out["Host"] = f"{host}:{port}" if port else host
+        if not keep_upgrade:
+            out["Connection"] = "close"
+        return out
+
+    def _read_request_body(self):
+        if (self.headers.get("Transfer-Encoding") or "").lower() == "chunked":
+            raise ValueError("chunked request body is not supported")
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n < 0:
+                raise ValueError("negative length")
+        except (TypeError, ValueError) as e:
+            raise ValueError("invalid Content-Length") from e
+        return self.rfile.read(n) if n else b""
+
+    def _proxy_http(self):
+        try:
+            body = self._read_request_body()
+        except ValueError as e:
+            self._send_json(400, {"error": str(e)})
+            return
+        conn = http.client.HTTPConnection(SCIENCE_UPSTREAM_HOST, SCIENCE_UPSTREAM_PORT, timeout=300)
+        try:
+            conn.request(self.command, self.path, body=body, headers=self._forward_headers())
+            resp = conn.getresponse()
+            payload = resp.read()
+            self.send_response(resp.status, resp.reason)
+            for key, value in resp.getheaders():
+                lower = key.lower()
+                if lower in HOP_BY_HOP_HEADERS or lower == "content-length":
+                    continue
+                self.send_header(key, value)
+            self.send_header("Content-Length", str(len(payload)))
+            if self.close_connection:
+                self.send_header("Connection", "close")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(payload)
+        except Exception as e:
+            log(f"science proxy {self.command} {self.path} -> 502: {e}")
+            self._send_json(502, {"error": str(e)})
+        finally:
+            conn.close()
+
+    def _proxy_websocket(self):
+        try:
+            upstream = socket.create_connection((SCIENCE_UPSTREAM_HOST, SCIENCE_UPSTREAM_PORT), timeout=10)
+        except Exception as e:
+            log(f"science ws {self.path} -> 502: {e}")
+            self._send_json(502, {"error": str(e)})
+            return
+        try:
+            lines = [f"{self.command} {self.path} HTTP/1.1".encode("utf-8")]
+            for key, value in self._forward_headers(keep_upgrade=True).items():
+                lines.append(f"{key}: {value}".encode("utf-8"))
+            upstream.sendall(b"\r\n".join(lines) + b"\r\n\r\n")
+            response = b""
+            while b"\r\n\r\n" not in response:
+                chunk = upstream.recv(4096)
+                if not chunk:
+                    raise ConnectionError("upstream closed during websocket handshake")
+                response += chunk
+                if len(response) > 65536:
+                    raise ConnectionError("websocket handshake too large")
+            self.connection.sendall(response)
+            self._tunnel(self.connection, upstream)
+        except Exception as e:
+            log(f"science ws {self.path} tunnel error: {e}")
+        finally:
+            try:
+                upstream.close()
+            except Exception:
+                pass
+            self.close_connection = True
+
+    @staticmethod
+    def _tunnel(client, upstream):
+        socks = [client, upstream]
+        while True:
+            try:
+                ready, _, _ = select.select(socks, [], [])
+            except Exception:
+                return
+            for src in ready:
+                dst = upstream if src is client else client
+                try:
+                    data = src.recv(65536)
+                except Exception:
+                    return
+                if not data:
+                    return
+                try:
+                    dst.sendall(data)
+                except Exception:
+                    return
+
+    def _handle(self):
+        if self._path_only() == "/api/models":
+            code, body = build_science_models_response()
+            self._send_json(code, body)
+            return
+        if self._is_websocket_upgrade():
+            self._proxy_websocket()
+            return
+        self._proxy_http()
+
+    def do_GET(self):
+        self._handle()
+
+    def do_HEAD(self):
+        self._handle()
+
+    def do_POST(self):
+        self._handle()
+
+    def do_OPTIONS(self):
+        self._handle()
+
+    def do_PUT(self):
+        self._handle()
+
+    def do_PATCH(self):
+        self._handle()
+
+    def do_DELETE(self):
+        self._handle()
+
+
+def bind_server(host, port, handler, label):
+    server = None
+    for attempt in range(10):
+        try:
+            server = ThreadingHTTPServer((host, port), handler)
+            return server
+        except OSError as e:
+            if attempt == 9:
+                print(f"[csswitch] {label} 端口 {port} 无法绑定：{e}。", file=sys.stderr, flush=True)
+                sys.exit(2)
+            time.sleep(0.3)
+    return server
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--provider", default=os.environ.get("CSSWITCH_PROVIDER", "deepseek"),
@@ -845,6 +1092,16 @@ if __name__ == "__main__":
     ap.add_argument("--auth-token", default=None)
     ap.add_argument("--relay-base", default=None,
                     help="relay provider 的中转站 base_url（也可用环境变量 CSSWITCH_RELAY_BASE_URL）")
+    ap.add_argument("--science-shim-host", default=None,
+                    help="可选：监听 Claude Science UI 的前置代理地址")
+    ap.add_argument("--science-shim-port", type=int, default=None,
+                    help="可选：监听 Claude Science UI 的前置代理端口")
+    ap.add_argument("--science-upstream-host", default=None,
+                    help="可选：Claude Science 真正监听的上游地址")
+    ap.add_argument("--science-upstream-port", type=int, default=None,
+                    help="可选：Claude Science 真正监听的上游端口")
+    ap.add_argument("--science-default-model", default=None,
+                    help="可选：/api/models 返回的默认模型 id")
     args = ap.parse_args()
     PROV_NAME = args.provider
     PROV = PROVIDERS[PROV_NAME]
@@ -873,20 +1130,33 @@ if __name__ == "__main__":
         sys.exit(1)
     # DSML 兜底 shim 模式（默认 off；relay 恒 off；deepseek 且 dsml_capable 才读环境变量）。
     SHIM_MODE = dsml_shim.shim_mode(PROV_NAME, PROV)
+    SCIENCE_SHIM_HOST = (os.environ.get("CSSWITCH_SCIENCE_SHIM_HOST") or args.science_shim_host or "").strip() or None
+    SCIENCE_SHIM_PORT = args.science_shim_port or (
+        int(os.environ["CSSWITCH_SCIENCE_SHIM_PORT"])
+        if os.environ.get("CSSWITCH_SCIENCE_SHIM_PORT") else None
+    )
+    SCIENCE_UPSTREAM_HOST = (
+        os.environ.get("CSSWITCH_SCIENCE_UPSTREAM_HOST") or args.science_upstream_host or "127.0.0.1"
+    ).strip() or "127.0.0.1"
+    SCIENCE_UPSTREAM_PORT = args.science_upstream_port or (
+        int(os.environ["CSSWITCH_SCIENCE_UPSTREAM_PORT"])
+        if os.environ.get("CSSWITCH_SCIENCE_UPSTREAM_PORT") else None
+    )
+    SCIENCE_DEFAULT_MODEL = (
+        os.environ.get("CSSWITCH_SCIENCE_DEFAULT_MODEL") or args.science_default_model or RELAY_FORCE_MODEL
+        or PROV.get("default_model")
+    )
+    if SCIENCE_SHIM_PORT and not SCIENCE_UPSTREAM_PORT:
+        print("启用 Science UI 代理时必须提供 science upstream port。", file=sys.stderr)
+        sys.exit(1)
     log(f"CSSwitch 代理启动 127.0.0.1:{args.port}  provider={PROV_NAME}  "
         f"key=已加载(未显示)  上游={PROV['url']}  dsml_shim={SHIM_MODE}")
-    # 绑定重试：上次会话遗留的孤儿代理可能还占着端口（app 侧会主动清，但退干净需一点时间）。
-    # 重试 ~3s 等端口释放，避免一次绑不上就直接失败（Errno 48）。
-    srv = None
-    for attempt in range(10):
-        try:
-            srv = ThreadingHTTPServer(("127.0.0.1", args.port), H)
-            break
-        except OSError as e:
-            if attempt == 9:
-                print(f"[csswitch] 端口 {args.port} 无法绑定：{e}。"
-                      f"可能被占用（结束占用进程，或在面板「高级」里换个端口）。",
-                      file=sys.stderr, flush=True)
-                sys.exit(2)
-            time.sleep(0.3)
+    if SCIENCE_SHIM_PORT:
+        log(f"Science UI 代理启动 {SCIENCE_SHIM_HOST or '127.0.0.1'}:{SCIENCE_SHIM_PORT} -> "
+            f"{SCIENCE_UPSTREAM_HOST}:{SCIENCE_UPSTREAM_PORT} default_model={SCIENCE_DEFAULT_MODEL}")
+    srv = bind_server("127.0.0.1", args.port, H, "代理")
+    if SCIENCE_SHIM_PORT:
+        shim_host = SCIENCE_SHIM_HOST or "127.0.0.1"
+        shim_srv = bind_server(shim_host, SCIENCE_SHIM_PORT, ScienceShimH, "Science UI 代理")
+        threading.Thread(target=shim_srv.serve_forever, name="science-ui-proxy", daemon=True).start()
     srv.serve_forever()

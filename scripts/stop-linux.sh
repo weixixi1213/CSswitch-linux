@@ -9,6 +9,8 @@ RUN_DIR="$STATE_ROOT/run"
 SANDBOX_HOME="$STATE_ROOT/home"
 DATA_DIR="$SANDBOX_HOME/.claude-science"
 PROXY_PID_FILE="$RUN_DIR/proxy.pid"
+SCIENCE_PUBLIC_PORT_FILE="$RUN_DIR/science.public_port"
+SCIENCE_BACKEND_PORT_FILE="$RUN_DIR/science.backend_port"
 
 if [[ -n "${SCIENCE_BIN:-}" ]]; then
   HOME="$SANDBOX_HOME" "$SCIENCE_BIN" stop --data-dir "$DATA_DIR" >/dev/null 2>&1 || true
@@ -26,5 +28,7 @@ if [[ -f "$PROXY_PID_FILE" ]]; then
   fi
   rm -f "$PROXY_PID_FILE"
 fi
+
+rm -f "$SCIENCE_PUBLIC_PORT_FILE" "$SCIENCE_BACKEND_PORT_FILE"
 
 echo "stopped csswitch linux stack"

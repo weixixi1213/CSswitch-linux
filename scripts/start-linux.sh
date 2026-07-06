@@ -12,8 +12,10 @@ PROVIDER="deepseek"
 API_KEY="${API_KEY:-}"
 RELAY_BASE="${RELAY_BASE:-}"
 RELAY_MODEL="${RELAY_MODEL:-}"
+RELAY_AUTO_SELECT_MODEL="${CSSWITCH_RELAY_AUTO_SELECT_MODEL:-0}"
 PROXY_PORT="${PROXY_PORT:-18991}"
 SCIENCE_PORT="${SCIENCE_PORT:-8000}"
+SCIENCE_BACKEND_PORT="${SCIENCE_BACKEND_PORT:-}"
 SANDBOX_PORT="${SANDBOX_PORT:-8001}"
 HOST="${HOST:-127.0.0.1}"
 STATE_ROOT="${STATE_ROOT:-${HOME:-/root}/.csswitch-linux}"
@@ -21,6 +23,7 @@ EMAIL="${EMAIL:-virtual@localhost.invalid}"
 UNSAFE_FULL_ACCESS=0
 SKIP_ONBOARDING=1
 AUTO_SELECTED_RELAY_MODEL=0
+SCIENCE_PROXY_ENABLED=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -28,8 +31,10 @@ while [[ $# -gt 0 ]]; do
     --api-key) API_KEY="$2"; shift 2 ;;
     --relay-base) RELAY_BASE="$2"; shift 2 ;;
     --relay-model) RELAY_MODEL="$2"; shift 2 ;;
+    --auto-relay-model) RELAY_AUTO_SELECT_MODEL=1; shift ;;
     --proxy-port) PROXY_PORT="$2"; shift 2 ;;
     --science-port) SCIENCE_PORT="$2"; shift 2 ;;
+    --science-backend-port) SCIENCE_BACKEND_PORT="$2"; shift 2 ;;
     --sandbox-port) SANDBOX_PORT="$2"; shift 2 ;;
     --host) HOST="$2"; shift 2 ;;
     --state-root) STATE_ROOT="$2"; shift 2 ;;
@@ -95,6 +100,8 @@ PROXY_SECRET_FILE="$RUN_DIR/proxy.secret"
 PROXY_LOG_FILE="$LOG_DIR/proxy.log"
 PROXY_STDOUT_FILE="$LOG_DIR/proxy.stdout.log"
 SCIENCE_STDOUT_FILE="$LOG_DIR/science-bootstrap.log"
+SCIENCE_PUBLIC_PORT_FILE="$RUN_DIR/science.public_port"
+SCIENCE_BACKEND_PORT_FILE="$RUN_DIR/science.backend_port"
 mkdir -p "$RUN_DIR" "$LOG_DIR" "$SANDBOX_HOME"
 
 if [[ ! -f "$PROXY_SECRET_FILE" ]]; then
@@ -178,8 +185,62 @@ PY
 }
 
 if [[ "$PROVIDER" == "relay" && -z "$RELAY_MODEL" ]]; then
-  discover_relay_model
+  if [[ "$RELAY_AUTO_SELECT_MODEL" == "1" ]]; then
+    discover_relay_model
+  fi
 fi
+
+SCIENCE_PUBLIC_PORT="$SCIENCE_PORT"
+SCIENCE_RUNTIME_PORT="$SCIENCE_PORT"
+SCIENCE_PROXY_HOST="$HOST"
+SCIENCE_UPSTREAM_HOST="$HOST"
+if [[ "$SCIENCE_UPSTREAM_HOST" == "0.0.0.0" || "$SCIENCE_UPSTREAM_HOST" == "::" ]]; then
+  SCIENCE_UPSTREAM_HOST="127.0.0.1"
+fi
+if [[ "$PROVIDER" == "relay" ]]; then
+  SCIENCE_PROXY_ENABLED=1
+  if [[ -z "$SCIENCE_BACKEND_PORT" ]]; then
+    SCIENCE_BACKEND_PORT="$((SCIENCE_PUBLIC_PORT + 2))"
+  fi
+  if [[ "$SCIENCE_BACKEND_PORT" == "$SCIENCE_PUBLIC_PORT" ]]; then
+    echo "science backend port must differ from public science port in relay mode" >&2
+    exit 1
+  fi
+  SCIENCE_RUNTIME_PORT="$SCIENCE_BACKEND_PORT"
+fi
+
+printf '%s\n' "$SCIENCE_PUBLIC_PORT" > "$SCIENCE_PUBLIC_PORT_FILE"
+printf '%s\n' "$SCIENCE_RUNTIME_PORT" > "$SCIENCE_BACKEND_PORT_FILE"
+
+rewrite_science_url_port() {
+  local raw_url="$1"
+  local target_port="$2"
+  "$PYTHON_BIN" - "$raw_url" "$target_port" <<'PY'
+from urllib.parse import urlsplit, urlunsplit
+import sys
+
+raw_url, port_text = sys.argv[1:3]
+port = int(port_text)
+parts = urlsplit(raw_url)
+host = parts.hostname or "localhost"
+if ":" in host and not host.startswith("["):
+    host = f"[{host}]"
+default_port = 443 if parts.scheme == "https" else 80
+netloc = host if port == default_port else f"{host}:{port}"
+print(urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment)))
+PY
+}
+
+browser_science_url() {
+  local raw_url
+  raw_url="$(HOME="$SANDBOX_HOME" "$SCIENCE_BIN" url --data-dir "$DATA_DIR" 2>/dev/null | head -n 1)"
+  [[ -n "$raw_url" ]] || return 1
+  if [[ "$SCIENCE_PUBLIC_PORT" != "$SCIENCE_RUNTIME_PORT" ]]; then
+    rewrite_science_url_port "$raw_url" "$SCIENCE_PUBLIC_PORT"
+  else
+    printf '%s\n' "$raw_url"
+  fi
+}
 
 stop_proxy_if_running() {
   if [[ -f "$PROXY_PID_FILE" ]]; then
@@ -224,6 +285,13 @@ start_proxy() {
         if [[ -n "$RELAY_MODEL" ]]; then
           export CSSWITCH_RELAY_MODEL="$RELAY_MODEL"
         fi
+        if [[ "$SCIENCE_PROXY_ENABLED" == "1" ]]; then
+          export CSSWITCH_SCIENCE_SHIM_HOST="$SCIENCE_PROXY_HOST"
+          export CSSWITCH_SCIENCE_SHIM_PORT="$SCIENCE_PUBLIC_PORT"
+          export CSSWITCH_SCIENCE_UPSTREAM_HOST="$SCIENCE_UPSTREAM_HOST"
+          export CSSWITCH_SCIENCE_UPSTREAM_PORT="$SCIENCE_RUNTIME_PORT"
+          export CSSWITCH_SCIENCE_DEFAULT_MODEL="${RELAY_MODEL:-claude-opus-4-8}"
+        fi
         ;;
     esac
     nohup "${proxy_cmd[@]}" >"$PROXY_STDOUT_FILE" 2>&1 &
@@ -253,7 +321,7 @@ start_science() {
   no_proxy="$NO_PROXY_LIST" NO_PROXY="$NO_PROXY_LIST" \
   "$SCIENCE_BIN" serve \
     --data-dir "$DATA_DIR" \
-    --port "$SCIENCE_PORT" \
+    --port "$SCIENCE_RUNTIME_PORT" \
     --sandbox-port "$SANDBOX_PORT" \
     --host "$HOST" \
     --no-browser \
@@ -265,7 +333,7 @@ start_science() {
 
 verify_virtual_login() {
   local url cookie auth_json nonce
-  url="$(HOME="$SANDBOX_HOME" "$SCIENCE_BIN" url --data-dir "$DATA_DIR" 2>/dev/null | head -n 1)"
+  url="$(browser_science_url)"
   nonce="$(printf '%s' "$url" | sed -n 's#.*[?&]nonce=\([^&]*\).*#\1#p')"
   [[ -n "$nonce" ]] || { echo "failed to extract login nonce" >&2; return 1; }
   cookie="$(mktemp)"
@@ -275,8 +343,8 @@ verify_virtual_login() {
     -X POST \
     --data-urlencode "nonce=$nonce" \
     --data-urlencode "dest=/auth/status" \
-    "http://localhost:${SCIENCE_PORT}/api/auth/nonce" >/dev/null
-  auth_json="$(curl -fsS -b "$cookie" "http://localhost:${SCIENCE_PORT}/api/auth/status")"
+    "http://localhost:${SCIENCE_PUBLIC_PORT}/api/auth/nonce" >/dev/null
+  auth_json="$(curl -fsS -b "$cookie" "http://localhost:${SCIENCE_PUBLIC_PORT}/api/auth/status")"
   "$PYTHON_BIN" - <<'PY' "$auth_json" >/dev/null
 import json
 import sys
@@ -288,7 +356,7 @@ PY
   trap - RETURN
   AUTH_STATUS_JSON="$auth_json"
   # The nonce used for verification is single-use. Print a fresh browser URL.
-  SCIENCE_URL="$(HOME="$SANDBOX_HOME" "$SCIENCE_BIN" url --data-dir "$DATA_DIR" 2>/dev/null | head -n 1)"
+  SCIENCE_URL="$(browser_science_url)"
 }
 
 echo "== ensure virtual login =="
@@ -301,8 +369,13 @@ echo "proxy: ${MASKED_PROXY_URL}"
 if [[ "$PROVIDER" == "relay" ]]; then
   if [[ "$AUTO_SELECTED_RELAY_MODEL" == "1" ]]; then
     echo "relay model: $RELAY_MODEL (auto-selected)"
-  else
+  elif [[ -n "$RELAY_MODEL" ]]; then
     echo "relay model: $RELAY_MODEL"
+  else
+    echo "relay model: dynamic (requests pass through, UI list comes from /api/models)"
+  fi
+  if [[ "$SCIENCE_PROXY_ENABLED" == "1" ]]; then
+    echo "science ui proxy: ${SCIENCE_PROXY_HOST}:${SCIENCE_PUBLIC_PORT} -> ${SCIENCE_UPSTREAM_HOST}:${SCIENCE_RUNTIME_PORT}"
   fi
 fi
 
