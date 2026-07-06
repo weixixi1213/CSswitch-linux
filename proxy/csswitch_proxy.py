@@ -939,8 +939,22 @@ class ScienceShimH(BaseHTTPRequestHandler):
             out[key] = value
         host = SCIENCE_UPSTREAM_HOST or "127.0.0.1"
         port = SCIENCE_UPSTREAM_PORT
-        out["Host"] = f"{host}:{port}" if port else host
-        if not keep_upgrade:
+        upstream_host = f"{host}:{port}" if port else host
+        out["Host"] = upstream_host
+        # Claude Science validates WebSocket Origin against its own listening
+        # port. When the UI is served through this shim on a public port, the
+        # browser naturally sends the shim origin; rewrite it to the upstream
+        # origin so daemon WebSockets are not rejected as cross-origin.
+        for origin_key in ("Origin", "Referer"):
+            raw = out.get(origin_key)
+            if not raw:
+                continue
+            out[origin_key] = raw.replace(
+                f":{SCIENCE_SHIM_PORT}",
+                f":{SCIENCE_UPSTREAM_PORT}",
+                1,
+            )
+          if not keep_upgrade:
             out["Connection"] = "close"
         return out
 
